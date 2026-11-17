@@ -520,7 +520,8 @@
           sameEl: !!(fromVideo && v === fromVideo),
           urlChanged: pageKey() !== fromUrl,
           fromPost: fromStatusId || '',
-          toPost: statusIdForVideo(v)
+          toPost: statusIdForVideo(v),
+          startAt: Math.round((v.currentTime || 0) * 10) / 10
         });
         pauseOtherCopiesOfPost(fromStatusId, v);
         if (fromVideo && fromVideo !== v) {
@@ -628,7 +629,7 @@
     var found = nextVideoPostAfter(source, fromStatusId);
     if (!found) {
       if (tries >= MAX_SCROLL_TRIES) {
-        log('still no next video post after ' + tries + ' scrolls', { fromPost: fromStatusId || '' });
+        log('no next post after ' + tries + ' scrolls', { fromPost: fromStatusId || '' });
         advancing = false;
         if (done) done(false);
         return;
@@ -638,7 +639,7 @@
       window.setTimeout(function () { advanceToNextPost(source, fromSrc, fromStatusId, done, tries + 1); }, CFG.scrollLoadMs);
       return;
     }
-    log('next video post', { fromPost: fromStatusId || '', toPost: found.statusId });
+    log('next-status ' + found.statusId, { fromPost: fromStatusId || '', toPost: found.statusId });
     try { found.article.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' }); }
     catch (e) { found.article.scrollIntoView(true); }
     waitForVideoIn(found.article, Math.max(CFG.scrollLoadMs * 2, 1500), function (v) {
