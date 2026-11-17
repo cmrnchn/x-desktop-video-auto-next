@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Desktop Video Auto Next
 // @namespace    https://github.com/CMRNCHN/x-desktop-video-auto-next
-// @version      2.0.7
+// @version      2.0.8
 // @description  On X/Twitter desktop, when a video ends, play the next video instead of looping. Works in Chrome, Firefox, Safari, Edge, Brave, Opera.
 // @author       You
 // @match        https://x.com/*
@@ -15,7 +15,7 @@
 
 /*
  * IMPORTANT: Delete every older copy (v1.x / duplicate installs) in Tampermonkey.
- * You must see exactly one boot line:  [X-AutoNext] boot v2.0.7
+ * You must see exactly one boot line:  [X-AutoNext] boot v2.0.8
  *
  * Firefox page console cannot always call userscript functions (Xray /
  * "Permission denied"). Use postMessage or localStorage instead:
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.0.7';
+  var VERSION = '2.0.8';
   var DEBUG = true;
 
   // Prevent double-running when multiple copies are installed.
@@ -103,6 +103,7 @@
   var lastActiveVideo = null;
   var lastAdvanceAt = 0;
   var lastAdvanceFromSrc = '';
+  var MAX_SCROLL_TRIES = 8;
 
   function log() {
     if (!DEBUG) return;
@@ -141,6 +142,47 @@
 
   function srcKey(v) {
     return (v && (v.currentSrc || v.src || '')) || '';
+  }
+
+  // ---- Post identity (v2.0.8) --------------------------------------------
+  // Success after a clip ends = a DIFFERENT post (status id) is playing.
+  function statusIdFromHref(href) {
+    var m = /\/status\/(\d+)/.exec(href || '');
+    return m ? m[1] : '';
+  }
+
+  function statusIdForArticle(art) {
+    if (!art || !art.querySelector) return '';
+    var t = art.querySelector('a[href*="/status/"] time');
+    var a = t ? t.closest('a') : art.querySelector('a[href*="/status/"]');
+    return a ? statusIdFromHref(a.getAttribute('href')) : '';
+  }
+
+  function statusIdForVideo(v) {
+    if (!isVideoEl(v)) return '';
+    if (v.isConnected && isImmersiveViewerUrl() && isViewerPlayerVideo(v)) return statusIdFromHref(location.pathname);
+    var art = v.closest('article');
+    return art ? statusIdForArticle(art) : '';
+  }
+
+  function findArticleForStatus(id) {
+    if (!id) return null;
+    var arts = document.querySelectorAll('article');
+    for (var i = 0; i < arts.length; i++) if (statusIdForArticle(arts[i]) === id) return arts[i];
+    return null;
+  }
+
+  function pauseOtherCopiesOfPost(id, keep) {
+    if (!id) return;
+    var nodes = document.querySelectorAll('video');
+    for (var i = 0; i < nodes.length; i++) {
+      var v = nodes[i];
+      if (v === keep || v.paused) continue;
+      if (statusIdForVideo(v) === id) {
+        clearEndTimer(v);
+        try { v.pause(); } catch (e) { /* ignore */ }
+      }
+    }
   }
 
   function clearEndTimer(v) {
@@ -355,53 +397,6 @@
     }
   }
 
-  function openInVideoViewer(v) {
-    var href = statusVideoHref(v);
-    log('open viewer', href);
-    if (!href) return false;
-
-    var box = containerFor(v);
-    var link = box.querySelector('a[href*="/status/"][href*="/video/"]');
-    if (link) { hardClick(link); return true; }
-
-    try {
-      window.history.pushState({}, '', href);
-      window.dispatchEvent(new PopStateEvent('popstate'));
-    } catch (e) { /* ignore */ }
-    window.setTimeout(function () {
-      if (!/\/status\/\d+\/video\//.test(location.pathname)) location.assign(href);
-    }, CFG.viewerNavDelayMs);
-    return true;
-  }
-
-  function activateTimelineVideo(next, fromVideo) {
-    log('activate', { from: srcKey(fromVideo).slice(0, 48), to: srcKey(next).slice(0, 48) });
-
-    // Prefer in-timeline play; viewer hrefs are optional (often absent on live x.com).
-    var openedViewer = false;
-    if (CFG.preferViewer) {
-      var href = statusVideoHref(next);
-      if (href) openedViewer = openInVideoViewer(next);
-    }
-
-    if (openedViewer) {
-      // Same bar as viewer Next: href/nav is NOT success until a new clip is playing.
-      var waitMs = Math.max(CFG.viewerNavDelayMs * 5, CFG.advanceCooldownMs, 2000);
-      waitForNewPlaying(fromVideo, srcKey(fromVideo), waitMs, function (ok) {
-        if (ok) {
-          log('advance success (timeline → viewer → new playing)');
-          return;
-        }
-        log('advance fail after viewer href — falling back to in-timeline play');
-        playAndWaitTimeline(next, fromVideo, srcKey(fromVideo), null);
-      });
-      return;
-    }
-
-    // In-timeline: scroll+play, then wait — pause/lastActive only on confirmed new playing.
-    playAndWaitTimeline(next, fromVideo, srcKey(fromVideo), null);
-  }
-
   function playTimelineVideo(next, fromVideo) {
     var box = containerFor(next);
     try { box.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' }); }
@@ -412,19 +407,6 @@
       playVideo(next);
     }, CFG.playNudgeMs);
     window.setTimeout(function () { if (next.isConnected && next.paused) playVideo(next); }, CFG.playRetryMs);
-  }
-
-  function scrollToNextTimelineVideo(fromVideo) {
-    var next = findNextTimelineVideo(fromVideo);
-    if (next) { activateTimelineVideo(next, fromVideo); return; }
-
-    log('no next video in DOM — scrolling to load more');
-    window.scrollBy(0, Math.max(window.innerHeight * 0.9, 700));
-    window.setTimeout(function () {
-      var candidate = findNextTimelineVideo(fromVideo);
-      if (candidate) activateTimelineVideo(candidate, fromVideo);
-      else { log('still no next video after scroll'); advancing = false; }
-    }, CFG.scrollLoadMs);
   }
 
   function unlockAdvanceSoon() {
@@ -453,9 +435,14 @@
   // Prefer URL change, new src, or viewer-player advance — NOT "any other <video> playing".
   // Same-src / leftover timeline players must NOT count.
   // Empty fromSrc is unknown: never treat !sameSrc alone as proof of a new clip.
-  function newClipPlayReason(v, fromVideo, fromSrc, fromUrl) {
+  function newClipPlayReason(v, fromVideo, fromSrc, fromUrl, fromStatusId) {
     if (!isActivelyPlaying(v)) return '';
     if (!isUsableVideo(v) && !isViewerPlayerVideo(v)) return '';
+    // v2.0.8: when the source post is known, the playing clip must be a different post.
+    if (fromStatusId) {
+      var sid = statusIdForVideo(v);
+      if (!sid || sid === fromStatusId) return '';
+    }
 
     var sk = srcKey(v);
     var urlChanged = !!(fromUrl && pageKey() !== fromUrl);
@@ -484,19 +471,24 @@
     return '';
   }
 
-  function rejectPlayingReason(v, fromVideo, fromSrc, fromUrl) {
+  function rejectPlayingReason(v, fromVideo, fromSrc, fromUrl, fromStatusId) {
     if (!isActivelyPlaying(v)) return '';
+    if (fromStatusId) {
+      var sid = statusIdForVideo(v);
+      if (sid && sid === fromStatusId) return 'same-post';
+      if (!sid) return 'unknown-post';
+    }
     var sk = srcKey(v);
     var urlChanged = !!(fromUrl && pageKey() !== fromUrl);
     var sameSrc = !!(sk && fromSrc && sk === fromSrc);
     if (sameSrc && !urlChanged) return 'same-src';
     // Empty fromSrc: continuing play of the source element must still reject (log), not silent skip.
     if (!fromSrc && fromVideo && v === fromVideo && !urlChanged) return 'same-src';
-    if (fromVideo && v !== fromVideo && !newClipPlayReason(v, fromVideo, fromSrc, fromUrl)) return 'leftover';
+    if (fromVideo && v !== fromVideo && !newClipPlayReason(v, fromVideo, fromSrc, fromUrl, fromStatusId)) return 'leftover';
     return '';
   }
 
-  function waitForNewPlaying(fromVideo, fromSrc, timeoutMs, done) {
+  function waitForNewPlaying(fromVideo, fromSrc, timeoutMs, done, fromStatusId) {
     var start = Date.now();
     var fromUrl = pageKey();
     var intervalMs = 120;
@@ -515,9 +507,9 @@
       for (var i = 0; i < nodes.length; i++) {
         var v = nodes[i];
         if (!v || !v.isConnected) continue;
-        var via = newClipPlayReason(v, fromVideo, fromSrc, fromUrl);
+        var via = newClipPlayReason(v, fromVideo, fromSrc, fromUrl, fromStatusId);
         if (!via) {
-          var why = rejectPlayingReason(v, fromVideo, fromSrc, fromUrl);
+          var why = rejectPlayingReason(v, fromVideo, fromSrc, fromUrl, fromStatusId);
           if (why) rejectKind = why;
           continue;
         }
@@ -526,8 +518,11 @@
           elapsedMs: Date.now() - start,
           src: srcKey(v).slice(0, 48),
           sameEl: !!(fromVideo && v === fromVideo),
-          urlChanged: pageKey() !== fromUrl
+          urlChanged: pageKey() !== fromUrl,
+          fromPost: fromStatusId || '',
+          toPost: statusIdForVideo(v)
         });
+        pauseOtherCopiesOfPost(fromStatusId, v);
         if (fromVideo && fromVideo !== v) {
           clearEndTimer(fromVideo);
           try { if (!fromVideo.paused) fromVideo.pause(); } catch (e) { /* ignore */ }
@@ -539,8 +534,9 @@
       }
       if (rejectKind && Date.now() - lastRejectLogAt > 800) {
         lastRejectLogAt = Date.now();
-        log('reject ' + rejectKind + ' — need url|src|viewer', {
+        log('reject ' + rejectKind + ' — need url|src|viewer' + (fromStatusId ? ' + different post' : ''), {
           fromSrc: (fromSrc || '').slice(0, 48),
+          fromPost: fromStatusId || '',
           videos: nodes.length
         });
       }
@@ -592,40 +588,86 @@
     }
   }
 
-  // After leaving immersive: advance a real next timeline clip (new src/url), never leftovers in-viewer.
-  function advanceTimelineNewClip(source, fromSrc, done) {
-    var next = findNextTimelineVideo(source);
-    if (!next) {
-      log('no next timeline clip in DOM — scrolling to load more');
-      window.scrollBy(0, Math.max(window.innerHeight * 0.9, 700));
-      window.setTimeout(function () {
-        next = findNextTimelineVideo(source);
-        if (!next) {
-          log('still no next timeline clip after scroll');
-          if (done) done(false);
-          return;
-        }
-        playAndWaitTimeline(next, source, fromSrc, done);
-      }, CFG.scrollLoadMs);
-      return;
+  // v2.0.8: find the next post (different status id) below the source post that has a video.
+  // Anchor = source's own article if still in the timeline, else the source post's inline article.
+  function nextVideoPostAfter(source, fromStatusId) {
+    var anchor = null;
+    if (source && source.isConnected && !isViewerPlayerVideo(source)) anchor = source.closest('article');
+    if (!anchor) anchor = findArticleForStatus(fromStatusId);
+    var anchorTop = anchor ? anchor.getBoundingClientRect().top + window.scrollY : window.scrollY - 1;
+    var arts = document.querySelectorAll('article');
+    var best = null, bestTop = Infinity;
+    for (var i = 0; i < arts.length; i++) {
+      var art = arts[i];
+      if (art === anchor || (anchor && anchor.contains(art))) continue;
+      var sid = statusIdForArticle(art);
+      if (!sid || sid === fromStatusId) continue;
+      var hasPlayer = art.querySelector('video, [data-testid="videoPlayer"], [data-testid="videoComponent"]');
+      if (!hasPlayer) continue;
+      var top = art.getBoundingClientRect().top + window.scrollY;
+      if (top <= anchorTop + 10) continue;
+      if (top < bestTop) { best = art; bestTop = top; }
     }
-    playAndWaitTimeline(next, source, fromSrc, done);
+    return best ? { article: best, statusId: statusIdForArticle(best) } : null;
   }
 
-  function playAndWaitTimeline(next, fromVideo, fromSrc, done) {
-    var waitMs = Math.max(CFG.viewerNavDelayMs * 5, CFG.advanceCooldownMs, 2000);
+  function waitForVideoIn(article, timeoutMs, cb) {
+    var start = Date.now();
+    (function tick() {
+      var vids = article.isConnected ? article.querySelectorAll('video') : [];
+      for (var i = 0; i < vids.length; i++) if (isUsableVideo(vids[i])) { cb(vids[i]); return; }
+      if (Date.now() - start >= timeoutMs) { cb(null); return; }
+      window.setTimeout(tick, 150);
+    })();
+  }
+
+  // Scroll until a different video post appears (up to MAX_SCROLL_TRIES), then play it and
+  // wait for confirmed new playing on that different post.
+  function advanceToNextPost(source, fromSrc, fromStatusId, done, tries) {
+    tries = tries || 0;
+    var found = nextVideoPostAfter(source, fromStatusId);
+    if (!found) {
+      if (tries >= MAX_SCROLL_TRIES) {
+        log('still no next video post after ' + tries + ' scrolls', { fromPost: fromStatusId || '' });
+        advancing = false;
+        if (done) done(false);
+        return;
+      }
+      log('no next video post in DOM — scrolling to load more', { try: tries + 1, fromPost: fromStatusId || '' });
+      window.scrollBy(0, Math.max(window.innerHeight * 0.9, 700));
+      window.setTimeout(function () { advanceToNextPost(source, fromSrc, fromStatusId, done, tries + 1); }, CFG.scrollLoadMs);
+      return;
+    }
+    log('next video post', { fromPost: fromStatusId || '', toPost: found.statusId });
+    try { found.article.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' }); }
+    catch (e) { found.article.scrollIntoView(true); }
+    waitForVideoIn(found.article, Math.max(CFG.scrollLoadMs * 2, 1500), function (v) {
+      if (!v) {
+        log('next post has no usable <video> yet — skipping past it', { post: found.statusId });
+        // Treat this post as the new anchor-free floor: scroll a bit and keep looking.
+        if (tries >= MAX_SCROLL_TRIES) { advancing = false; if (done) done(false); return; }
+        window.scrollBy(0, Math.max(window.innerHeight * 0.5, 400));
+        window.setTimeout(function () { advanceToNextPost(source, fromSrc, fromStatusId, done, tries + 1); }, CFG.scrollLoadMs);
+        return;
+      }
+      playAndWaitTimeline(v, source, fromSrc, done, fromStatusId);
+    });
+  }
+
+  function playAndWaitTimeline(next, fromVideo, fromSrc, done, fromStatusId) {
+    var waitMs = Math.max(CFG.viewerNavDelayMs * 5, CFG.advanceCooldownMs, 2000) + CFG.playRetryMs;
     // Prefer in-timeline play (do not reopen immersive leftover path).
     playTimelineVideo(next, fromVideo);
     waitForNewPlaying(fromVideo, fromSrc || srcKey(fromVideo), waitMs, function (ok) {
-      if (ok) log('advance success (timeline new clip → new playing)');
-      else log('timeout waiting for timeline new clip');
+      if (ok) log('advance success (next post → new playing)', { fromPost: fromStatusId || '' });
+      else log('timeout waiting for next post to play', { fromPost: fromStatusId || '' });
       if (done) done(ok);
-    });
+    }, fromStatusId);
   }
 
   // After leaveImmersiveViewer: do not advance timeline until pathname leaves /status/…/video/.
   // Poll briefly, retry Escape/close/back; if still immersive when the window ends — stop (no advance).
-  function leaveViewerThenAdvanceTimeline(source, key) {
+  function leaveViewerThenAdvanceTimeline(source, key, fromStatusId) {
     leaveImmersiveViewer();
     var started = Date.now();
     var pollEveryMs = 150;
@@ -634,8 +676,9 @@
 
     function tick() {
       if (!isImmersiveViewerUrl()) {
-        log('left viewer → advance timeline');
-        advanceTimelineNewClip(source, key, null);
+        log('left viewer → advance to next post', { fromPost: fromStatusId || '' });
+        // Give X a beat to restore the timeline before searching it.
+        window.setTimeout(function () { advanceToNextPost(source, key, fromStatusId, null, 0); }, CFG.scrollLoadMs);
         return;
       }
       if (Date.now() - started >= maxMs) {
@@ -654,7 +697,7 @@
     window.setTimeout(tick, Math.max(CFG.viewerNavDelayMs, 200));
   }
 
-  function immersiveNoEnabledNext(source, key) {
+  function immersiveNoEnabledNext(source, key, fromStatusId) {
     log('no enabled Next → ArrowDown');
     dispatchArrowDown();
     var waitMs = Math.max(CFG.viewerNavDelayMs * 5, CFG.advanceCooldownMs, 2000);
@@ -663,14 +706,13 @@
         log('advance success (ArrowDown → new playing)');
         return;
       }
-      log('ArrowDown timeout → leave viewer / timeline new clip');
-      leaveViewerThenAdvanceTimeline(source, key);
-    });
+      log('ArrowDown timeout → leave viewer / next post');
+      leaveViewerThenAdvanceTimeline(source, key, fromStatusId);
+    }, fromStatusId);
   }
 
-  function fallbackAfterViewer(source) {
-    if (/\/status\/\d+/.test(location.pathname)) dispatchArrowDown();
-    scrollToNextTimelineVideo(source);
+  function fallbackAfterViewer(source, key, fromStatusId) {
+    advanceToNextPost(source, key, fromStatusId, null, 0);
   }
 
   function goNext(reason, fromVideo) {
@@ -690,10 +732,13 @@
     unlockAdvanceSoon();
 
     var immersive = isImmersiveViewerUrl();
+    // v2.0.8: identity of the post that just ended; success must be a different post.
+    var fromStatusId = immersive ? statusIdFromHref(location.pathname) : statusIdForVideo(source);
     var viewerNext = findNextVideoButton(source);
     log('goNext', reason, {
       browser: CFG.browserId,
       path: location.pathname,
+      fromPost: fromStatusId,
       immersiveViewer: immersive,
       hasEnabledViewerNext: !!viewerNext,
       nextAria: viewerNext ? (viewerNext.getAttribute('aria-label') || '') : '',
@@ -717,14 +762,14 @@
               return;
             }
             log('timeout / no new playing after enabled Next — stop, no in-viewer leftover play');
-          });
+          }, fromStatusId);
           return;
         }
         // Click failed: treat as no usable Next.
-        immersiveNoEnabledNext(source, key);
+        immersiveNoEnabledNext(source, key, fromStatusId);
         return;
       }
-      immersiveNoEnabledNext(source, key);
+      immersiveNoEnabledNext(source, key, fromStatusId);
       return;
     }
 
@@ -740,14 +785,14 @@
             log('advance success (viewer Next → new playing)');
             return;
           }
-          log('advance fail after Next click — falling back to timeline');
-          fallbackAfterViewer(source);
-        });
+          log('advance fail after Next click — falling back to next post');
+          fallbackAfterViewer(source, key, fromStatusId);
+        }, fromStatusId);
         return;
       }
     }
 
-    fallbackAfterViewer(source);
+    fallbackAfterViewer(source, key, fromStatusId);
   }
 
   // ---- End detection -----------------------------------------------------
